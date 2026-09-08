@@ -1,0 +1,172 @@
+#!/bin/bash
+# editor-node -- run the VS Code/Cursor server inside a Slurm job instead of on
+# the login node.  Part of https://github.com/epflneuroailab/vscode-on-scitas
+# (see the README there for setup, rollback and troubleshooting).
+#
+#   editor-node start    # reuse or submit the job, wait for it, print the node
+#   editor-node status   # show job id / state / node
+#   editor-node stop     # scancel the job
+#   editor-node proxy    # stdio <-> node:22 bridge (used by ssh ProxyCommand)
+#
+#   editor-node probe    # print the cluster facts needed to validate defaults
+#   editor-node help     # print usage and the tunable environment variables
+#
+# Overrides: EN_NAME EN_PART EN_TIME EN_CPUS EN_MEM EN_GRES EN_QOS EN_WAIT EN_CLUSTER
+# Example (Kuma, one full H100 for 4 hours):
+#   EN_PART=h100 EN_GRES=gpu:1 EN_TIME=04:00:00 editor-node start
+set -uo pipefail
+
+CLUSTER="${EN_CLUSTER:-$(scontrol show config 2>/dev/null \
+    | awk -F'= *' '/^ClusterName/{print $2}' | tr -d '[:space:]')}"
+
+# Per-cluster defaults. Kuma refuses jobs without a GPU request, so it needs an
+# explicit MIG partition; anywhere else, fall back to whatever sinfo marks as the
+# default partition and request no GRES.
+case "$CLUSTER" in
+kuma)
+    DEF_PART=mig24gb        # NOT mig12gb: that caps at 2 cores per MIG slice
+    DEF_GRES=gpu:1
+    ;;
+*)
+    DEF_PART="$(sinfo -h -o '%P' 2>/dev/null | grep -m1 '\*' | tr -d '*')"
+    DEF_GRES=none
+    ;;
+esac
+
+NAME="${EN_NAME:-editor-host}"
+PART="${EN_PART:-$DEF_PART}"
+TIME="${EN_TIME:-12:00:00}"
+CPUS="${EN_CPUS:-4}"
+MEM="${EN_MEM:-16G}"
+GRES="${EN_GRES:-$DEF_GRES}"
+QOS="${EN_QOS:-}"
+WAIT="${EN_WAIT:-90}"
+
+# In proxy mode stdout carries the raw SSH stream, so all chatter goes to stderr.
+say() { printf 'editor-node: %s\n' "$*" >&2; }
+
+job_id()    { squeue -h --me --name="$NAME" --states=R,PD -o %i | head -1; }
+job_state() { squeue -h -j "$1" -o %T 2>/dev/null; }
+job_node()  { squeue -h -j "$1" -o %N 2>/dev/null; }
+
+submit() {
+    local extra=()
+    [[ -n "$GRES" && "$GRES" != none ]] && extra+=( --gres="$GRES" )
+    [[ -n "$QOS" ]] && extra+=( --qos="$QOS" )
+    if [[ -z "$PART" ]]; then
+        say "no partition: cluster '$CLUSTER' has no default one. Set EN_PART."
+        say "run 'editor-node probe' to see what this cluster offers."
+        return 1
+    fi
+    sbatch --parsable -J "$NAME" -p "$PART" "${extra[@]}" \
+           --nodes=1 --ntasks=1 --cpus-per-task="$CPUS" --mem="$MEM" \
+           --time="$TIME" -o /dev/null --wrap='sleep infinity'
+}
+
+LOCK="$HOME/.config/compute-node/${NAME}.lock"
+
+# Find-or-submit under a lock: an editor opens several SSH connections at once,
+# and without this each one would sbatch its own job.
+acquire() {
+    local jid
+    mkdir -p "$(dirname "$LOCK")" 2>/dev/null
+    exec 9>"$LOCK" || true
+    flock -w 60 9 2>/dev/null || say "lock timeout, proceeding unlocked"
+    jid="$(job_id)"
+    if [[ -z "$jid" ]]; then
+        jid="$(submit)" || { flock -u 9 2>/dev/null; return 1; }
+        say "submitted job $jid ($PART${QOS:+ qos=$QOS}, ${CPUS} cpu, $MEM, gres=$GRES, $TIME)"
+    fi
+    flock -u 9 2>/dev/null
+    printf '%s\n' "$jid"
+}
+
+# Prints the node name on stdout once the job is RUNNING.
+ensure() {
+    local jid node state waited=0
+    jid="$(acquire)" || { say "sbatch failed"; return 1; }
+    while :; do
+        state="$(job_state "$jid")"
+        if [[ "$state" == RUNNING ]]; then
+            node="$(job_node "$jid")"
+            [[ -n "$node" ]] && { printf '%s\n' "$node"; return 0; }
+        elif [[ -z "$state" || "$state" == CANCELLED* || "$state" == FAILED \
+             || "$state" == TIMEOUT || "$state" == COMPLETED ]]; then
+            say "job $jid is gone (state: ${state:-unknown})"
+            return 1
+        fi
+        if (( waited >= WAIT )); then
+            say "job $jid still $state after ${WAIT}s."
+            say "run 'editor-node start' and wait, or set EN_PART to a less busy partition"
+            return 1
+        fi
+        sleep 3
+        waited=$(( waited + 3 ))
+    done
+}
+
+case "${1:-proxy}" in
+proxy)
+    node="$(ensure)" || exit 1
+    say "bridging to ${node}:22"
+    exec 3<>"/dev/tcp/${node}/22"
+    # Only the reader may be backgrounded: a non-interactive shell rebinds a
+    # background job's stdin to /dev/null, which would EOF the writer instantly
+    # and kill the bridge before the SSH banner exchange.
+    cat <&3 & reader=$!
+    trap 'kill "$reader" 2>/dev/null' EXIT
+    cat >&3
+    ;;
+start)
+    node="$(ensure)" || exit 1
+    say "ready on $node -- now connect Remote-SSH to host '${CLUSTER}-node'"
+    ;;
+status)
+    jid="$(job_id)"
+    if [[ -z "$jid" ]]; then
+        say "no '$NAME' job (editor is NOT on a compute node)"
+    else
+        say "job $jid  state=$(job_state "$jid")  node=$(job_node "$jid")"
+    fi
+    ;;
+stop)
+    scancel --me --name="$NAME" && say "cancelled '$NAME'"
+    ;;
+probe)
+    say "cluster=$CLUSTER -> part=${PART:-<none>} gres=$GRES qos=${QOS:-<default>} cpus=$CPUS mem=$MEM time=$TIME"
+    echo "== partitions (name / timelimit / nodes / gres / maxmem-per-cpu)"
+    sinfo -h -o '%20P %12l %6D %30G' 2>/dev/null
+    scontrol show partition 2>/dev/null \
+        | awk '/PartitionName/{p=$1} /MaxMemPerCPU/{print p, $0}' | tr -s ' '
+    echo "== QOS ceilings"
+    sacctmgr -nP show qos format=Name,MaxWall,MaxTRES 2>/dev/null
+    echo "== my associations"
+    sacctmgr -nP show assoc where user="$USER" format=Cluster,Account,Partition,QOS 2>/dev/null
+    ;;
+help|-h|--help)
+    cat >&2 <<USAGE
+usage: editor-node {start|status|stop|proxy|probe|help}
+
+  start   reuse or submit the Slurm job, wait for it, print the node
+  status  show job id / state / node
+  stop    scancel the job (VS Code windows on it will disconnect)
+  proxy   stdio <-> node:22 bridge; used by the ssh ProxyCommand, not by hand
+  probe   print partitions, QOS ceilings and your associations on this cluster
+
+Environment overrides (current value in brackets):
+  EN_PART  partition        [${PART:-<none>}]
+  EN_GRES  GPU request      [$GRES]        e.g. gpu:1 (Kuma) or none
+  EN_TIME  wall time        [$TIME]
+  EN_CPUS  cores            [$CPUS]
+  EN_MEM   memory           [$MEM]
+  EN_QOS   QOS              [${QOS:-<default>}]
+  EN_WAIT  seconds to wait for the job before giving up [$WAIT]
+  EN_NAME  Slurm job name   [$NAME]        also the HostName in ~/.ssh/config
+
+Overrides only matter for the command that submits the job. To change
+resources of a running session: 'editor-node stop', then reconnect.
+USAGE
+    ;;
+*)
+    say "usage: editor-node {start|status|stop|proxy|probe|help}"; exit 2 ;;
+esac

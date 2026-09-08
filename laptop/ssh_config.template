@@ -1,0 +1,73 @@
+# ---- SCITAS login nodes ---------------------------------------------------
+# Fine for git, squeue, quick edits. Do NOT keep VS Code / Jupyter / agents here.
+
+Host jed jed.hpc.epfl.ch
+  HostName jed.hpc.epfl.ch
+  User __GASPAR__
+  ForwardX11 yes
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
+Host kuma kuma.hpc.epfl.ch
+  HostName kuma.hpc.epfl.ch
+  User __GASPAR__
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
+Host izar izar.hpc.epfl.ch
+  HostName izar.hpc.epfl.ch
+  User __GASPAR__
+  ForwardX11 yes
+
+Host helvetios helvetios.hpc.epfl.ch
+  HostName helvetios.hpc.epfl.ch
+  User __GASPAR__
+
+# ---- SCITAS compute nodes via editor-node (use these in VS Code) ----------
+# Each of these tunnels through the matching login node above, which submits
+# (or reuses) a small Slurm job and bridges you to the allocated compute node.
+
+Host jed-node
+  HostName editor-host
+  User __GASPAR__
+  ProxyCommand ssh jed "~/.local/bin/editor-node proxy"
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
+
+Host kuma-node
+  HostName editor-host
+  User __GASPAR__
+  ProxyCommand ssh kuma "~/.local/bin/editor-node proxy"
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
+
+# Untested by the lab so far (we have no course accounts). Same mechanism; if a
+# job needs a GPU or another partition, see 'editor-node help' on that cluster.
+
+Host izar-node
+  HostName editor-host
+  User __GASPAR__
+  ProxyCommand ssh izar "~/.local/bin/editor-node proxy"
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
+
+Host helvetios-node
+  HostName editor-host
+  User __GASPAR__
+  ProxyCommand ssh helvetios "~/.local/bin/editor-node proxy"
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 30
+  ServerAliveCountMax 6
